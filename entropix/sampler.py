@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 
 LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
+MAX_K = 256
 
 
 def calculate_varentropy_logsoftmax(logits: jnp.ndarray, axis: int = -1) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -27,16 +28,22 @@ def _sample( logits: jax.Array, *, temperature: float | jax.Array, top_p: float 
     logit = logits[:, -1]
     probs = jax.nn.softmax(logit / temperature, axis=-1)
 
-    # Apply min_p sampling
-    if min_p > 0.0:
-      p_max = jnp.max(probs, axis=-1, keepdims=True)
-      indices_to_remove = probs < (min_p * p_max)
-      logit = jnp.where(indices_to_remove, jnp.full_like(logit, float('-inf')), logit)
+    # Maybe apply min_p sampling
+    p_max = jnp.max(probs, axis=-1, keepdims=True)
+    indices_to_remove = probs < (min_p * p_max)
+    min_p_sampled_logit = jnp.where(indices_to_remove, jnp.full_like(logit, float('-inf')), logit)
+    logit = jax.lax.select(min_p > 0.0, min_p_sampled_logit, logit)
 
     # Apply top-k sampling
-    top_k_probs, top_k_indices = jax.lax.top_k(probs, k=top_k)
-    probs_sort = jnp.flip(top_k_probs, axis=-1)
-    probs_idx = jnp.flip(top_k_indices, axis=-1)
+    iota = jax.lax.iota(jnp.int32, probs.shape[1]).reshape(probs.shape)
+    _top_k_probs, _top_k_indices = jax.lax.sort_key_val(probs, iota)
+    probs_sort = jnp.where(jnp.flip(iota[:, :MAX_K], axis=-1) < top_k, _top_k_probs[:, -MAX_K:], 0.)
+    probs_idx = _top_k_indices[:, -MAX_K:]
+
+    # top_k_probs, top_k_indices = jax.lax.top_k(probs, k=top_k)
+    # probs_sort = jnp.flip(top_k_probs, axis=-1)
+    # probs_idx = jnp.flip(top_k_indices, axis=-1)
+
     probs_sum = jnp.cumsum(probs_sort, axis=-1)
     # Apply top-p sampling
     mask = jnp.where(probs_sum - probs_sort > top_p, 1.0, 0.0)
@@ -139,50 +146,72 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
     agreement = metrics["agreement"]
     interaction_strength = metrics["interaction_strength"]
     #print(f'{metrics=}')
+    def _and(*args):
+        res = True
+        for a in args:
+            res = jax.lax.bitwise_and(res, a)
+        return res
+
+    LELV = _and(ent < cfg.low_logits_entropy_threshold,
+        vent < cfg.low_logits_varentropy_threshold,
+        attn_ent < cfg.low_attention_entropy_threshold,
+        attn_vent < cfg.low_attention_varentropy_threshold,
+        agreement < cfg.low_agreement_threshold,
+        interaction_strength < cfg.low_interaction_strength_threshold).astype(float)
+
+    HELV = _and(ent > cfg.high_logits_entropy_threshold,
+          vent < cfg.low_logits_varentropy_threshold,
+          attn_ent < cfg.low_attention_entropy_threshold,
+          attn_vent < cfg.low_attention_varentropy_threshold,
+          agreement < cfg.low_agreement_threshold,
+          interaction_strength < cfg.low_interaction_strength_threshold).astype(float)
+
+    LEHV = _and(ent < cfg.high_logits_entropy_threshold,
+          vent > cfg.high_logits_varentropy_threshold,
+          attn_ent < cfg.low_attention_entropy_threshold,
+          attn_vent > cfg.high_attention_varentropy_threshold,
+          agreement < cfg.low_agreement_threshold,
+          interaction_strength > cfg.low_interaction_strength_threshold).astype(float)
+
+    HEHV = _and(ent > cfg.medium_logits_entropy_threshold,
+          vent > cfg.high_logits_varentropy_threshold,
+          attn_ent > cfg.high_attention_entropy_threshold,
+          attn_vent > cfg.high_attention_varentropy_threshold,
+          agreement > cfg.high_agreement_threshold,
+          interaction_strength > cfg.high_interaction_strength_threshold).astype(float)
+
+    case = jnp.argmax(jnp.hstack([LELV, HELV, LEHV, HEHV, jnp.array(1.).reshape(1)]))
 
     # Low Entropy, Low Varentropy: "flowing with unspoken intent"
-    if (ent < cfg.low_logits_entropy_threshold and
-        vent < cfg.low_logits_varentropy_threshold and
-        attn_ent < cfg.low_attention_entropy_threshold and
-        attn_vent < cfg.low_attention_varentropy_threshold and
-        agreement < cfg.low_agreement_threshold and
-        interaction_strength < cfg.low_interaction_strength_threshold):
+    def lelv():
         return jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
 
     # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
-    elif (ent > cfg.high_logits_entropy_threshold and
-          vent < cfg.low_logits_varentropy_threshold and
-          attn_ent < cfg.low_attention_entropy_threshold and
-          attn_vent < cfg.low_attention_varentropy_threshold and
-          agreement < cfg.low_agreement_threshold and
-          interaction_strength < cfg.low_interaction_strength_threshold):
-        # Insert a clarifying question token if not already present
-        if not jnp.isin(gen_tokens[:, -1], clarifying_question_token).any():
-            return jnp.array([[clarifying_question_token]]), color
-        else:
-            # If we've just asked a question, sample with slightly higher temperature
-            temp_adj = cfg.high_entropy_attention_offset + cfg.high_entropy_attention_coefficient * attn_ent  # Increase temperature based on attention entropy
-            return _sample(
-                logits,
-                temperature=min(1.5, cfg.temperature * temp_adj),
-                top_p=cfg.top_p,
-                top_k=cfg.top_k,
-                min_p=cfg.min_probability,
-                key=key
-            )
+    def helv():
+        # FIXME: gen_tokens is undefined
+        # # Insert a clarifying question token if not already present
+        # if not jnp.isin(gen_tokens[:, -1], clarifying_question_token).any():
+        #     return jnp.array([[clarifying_question_token]]), color
+        # else:
 
-    # Low Entropy, High Varentropy: "exploring forks in the path"
-    elif (ent < cfg.high_logits_entropy_threshold and
-          vent > cfg.high_logits_varentropy_threshold and
-          attn_ent < cfg.low_attention_entropy_threshold and
-          attn_vent > cfg.high_attention_varentropy_threshold and
-          agreement < cfg.low_agreement_threshold and
-          interaction_strength > cfg.low_interaction_strength_threshold):
-        temp_adj = cfg.low_entropy_interaction_strength_offset + cfg.low_entropy_interaction_strength_coefficient * interaction_strength  # Increase temperature based on interaction strength
-        top_k_adj = max(5, int(cfg.top_k * (1 + 0.5 * (1 - agreement))))  # Increase top_k when agreement is low
+        # If we've just asked a question, sample with slightly higher temperature
+        temp_adj = cfg.high_entropy_attention_offset + cfg.high_entropy_attention_coefficient * attn_ent  # Increase temperature based on attention entropy
         return _sample(
             logits,
-            temperature=min(1.5, cfg.temperature * temp_adj),
+            temperature=jnp.minimum(1.5, cfg.temperature * temp_adj),
+            top_p=cfg.top_p,
+            top_k=cfg.top_k,
+            min_p=cfg.min_probability,
+            key=key
+        )
+
+    # Low Entropy, High Varentropy: "exploring forks in the path"
+    def lehv():
+        temp_adj = cfg.low_entropy_interaction_strength_offset + cfg.low_entropy_interaction_strength_coefficient * interaction_strength  # Increase temperature based on interaction strength
+        top_k_adj = jnp.maximum(5, (cfg.top_k * (1 + 0.5 * (1 - agreement))).astype(int))  # Increase top_k when agreement is low
+        return _sample(
+            logits,
+            temperature=jnp.minimum(1.5, cfg.temperature * temp_adj),
             top_p=cfg.top_p,
             top_k=top_k_adj,
             min_p=cfg.min_probability,
@@ -190,18 +219,13 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
         )
 
     # High Entropy, High Varentropy: "resampling in the mist"
-    elif (ent > cfg.medium_logits_entropy_threshold and
-          vent > cfg.high_logits_varentropy_threshold and
-          attn_ent > cfg.high_attention_entropy_threshold and
-          attn_vent > cfg.high_attention_varentropy_threshold and
-          agreement > cfg.high_agreement_threshold and
-          interaction_strength > cfg.high_interaction_strength_threshold):
+    def hehv():
         # Use high temperature and adjusted top_p based on attention metrics
         temp_adj = cfg.high_entropy_varentropy_attention_offset + cfg.high_entropy_varentropy_attention_coefficient * attn_vent  # Increase temperature based on attention varentropy
-        top_p_adj = max(0.5, cfg.top_p - cfg.high_entropy_attention_coefficient * attn_ent)  # Decrease top_p when attention entropy is high
+        top_p_adj = jnp.maximum(0.5, cfg.top_p - cfg.high_entropy_attention_coefficient * attn_ent)  # Decrease top_p when attention entropy is high
         return _sample(
             logits,
-            temperature=max(2.0, cfg.temperature * temp_adj),
+            temperature=jnp.minimum(2.0, cfg.temperature * temp_adj),
             top_p=top_p_adj,
             top_k=cfg.top_k,
             min_p=cfg.min_probability,
@@ -209,7 +233,7 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
         )
 
     # Middle ground: use adaptive sampling
-    else:
+    def adaptive_sampling():
         logits_uncertainty = metrics["logits_entropy"] + metrics["logits_varentropy"]
         attn_uncertainty = metrics["attn_entropy"] + metrics["attn_varentropy"]
 
@@ -224,15 +248,15 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
             0.1,
             1.0
         )
-        top_k = int(jnp.clip(
+        top_k = jnp.clip(
             jnp.round(cfg.top_k * (
                 1 +
-                cfg.adaptive_top_k_interaction_coefficient * interaction_strength.item() -
-                cfg.adaptive_top_k_agreement_coefficient * agreement.item()
-            )),
+                cfg.adaptive_top_k_interaction_coefficient * interaction_strength -
+                cfg.adaptive_top_k_agreement_coefficient * agreement
+            ).squeeze()),
             a_min=1,
             a_max=100
-        ))
+        ).astype(int)
         min_p = jnp.clip(
             cfg.min_probability * (1 - cfg.adaptive_min_p_coefficient * vent),
             0.01,
@@ -270,4 +294,19 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
 
         sample_scores = jnp.array([score_sample(sample) for sample in samples])
         best_sample_idx = jnp.argmax(sample_scores)
-        return samples[best_sample_idx]
+        return jnp.array(samples)[best_sample_idx]
+
+    # if LELV:
+    #     res = lelv()
+    # elif HELV:
+    #     res = helv()
+    # elif LEHV:
+    #     res = lehv()
+    # elif HEHV:
+    #     res = hehv()
+    # else:
+    #     res = adaptive_sampling()
+
+    return jax.lax.switch(case, (lelv, helv, lehv, hehv, adaptive_sampling))
+    # assert  jax.lax.switch(case, (lelv, helv, lehv, hehv, adaptive_sampling)) == res
+    # return res

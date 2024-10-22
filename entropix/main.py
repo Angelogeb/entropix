@@ -1,6 +1,7 @@
 from typing import Tuple
 
 import math
+import time
 from pathlib import Path
 
 import jax
@@ -85,15 +86,27 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instru
     stop = jnp.array([128001, 128008, 128009])
     sampler_cfg = SamplerConfig()
     gen_tokens = [next_token]
+    profile = False
+    start_pos = cur_pos
+
+    start = time.time()
     while cur_pos < 8192:
       cur_pos += 1
+      if cur_pos == start_pos + 10:
+        start = time.time()
+      if profile and cur_pos == start_pos + 10:
+        jax.profiler.start_trace("profile")
       logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-      next_token = sample(logits, scores, cfg=sampler_cfg)
+      next_token = sample_fn(logits, scores, cfg=sampler_cfg)
       gen_tokens.append(next_token)
       out_token = tokenizer.decode(next_token.tolist()[0])
       print(out_token, end='', flush=True)
+      if profile and cur_pos == start_pos + 10:
+        jax.profiler.stop_trace()
       if jnp.isin(next_token, stop).any():
         break
+
+    print(f"{(cur_pos - (start_pos + 10))/(time.time() - start):.3} toks/s")
 
   prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
