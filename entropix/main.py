@@ -65,9 +65,9 @@ def build_attn_mask(seqlen: int, start_pos: int) -> jax.Array:
 #def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
 def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instruct')):
   model_params = LLAMA_1B_PARAMS
-  xfmr_weights = load_weights(weights_path.absolute(), n_layers=model_params.n_layers)
+  xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
   tokenizer = Tokenizer('entropix/tokenizer.model')
-  xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
+  xfmr_fn = jax.jit(xfmr, static_argnames=("model_params", "decode"))
   sample_fn = jax.jit(sample, static_argnames=("cfg",))
 
   # Create the batch of tokens
@@ -77,13 +77,14 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instru
     tokens = jnp.array([tokens], jnp.int32)
     bsz, seqlen = tokens.shape
     attn_mask = build_attn_mask(seqlen, cur_pos)
-    freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
+    replicated = jax.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    freqs_cis = jax.device_put(precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope), replicated)
     kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
     logits, kvcache, _, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
     next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
     print(tokenizer.decode([next_token.item()]), end='', flush=True)
     cur_pos = seqlen
-    stop = jnp.array([128001, 128008, 128009])
+    stop = jax.device_put(jnp.array([128001, 128008, 128009]), replicated)
     sampler_cfg = SamplerConfig()
     gen_tokens = [next_token]
     profile = False
@@ -96,7 +97,7 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instru
         start = time.time()
       if profile and cur_pos == start_pos + 10:
         jax.profiler.start_trace("profile")
-      logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+      logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis, kvcache, decode=True)
       next_token = sample_fn(logits, scores, cfg=sampler_cfg)
       gen_tokens.append(next_token)
       out_token = tokenizer.decode(next_token.tolist()[0])
@@ -120,7 +121,8 @@ Think carefully in a step-by-step manner. Oliver picks 44 kiwis on Friday. Then 
 """
   print(prompt)
   tokens = tokenizer.encode(prompt,  bos=False, eos=False, allowed_special='all')
-  generate(xfmr_weights, model_params, tokens)
+  with mesh:
+    generate(xfmr_weights, model_params, tokens)
 
 
 import os

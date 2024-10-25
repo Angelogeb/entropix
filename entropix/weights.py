@@ -42,25 +42,30 @@ def create_partition_spec(key):
         return PS(fsdp, mp)
     elif 'output' in key:
         return PS(fsdp, mp)
-    elif 'w2' in key:
-        return PS(fsdp, mp)
-    else:
+    elif 'w2' in key or 'wo' in key:
         return PS(mp, fsdp)
+    else:
+        return PS(fsdp, mp)
 
 
-def load_weights(ckpt_dir: Path, n_layers: int = 80):
+def load_weights(ckpt_dir: Path, model_params):
     w = {}
     layer_weights = []
-    mesh = jax.sharding.Mesh(mesh_utils.create_device_mesh((1, 8)), ('mp', 'fsdp'))
+    mesh = jax.sharding.Mesh(mesh_utils.create_device_mesh((8, 1)), ('mp', 'fsdp'))
     
     for file in ckpt_dir.glob("*.npy"):
         name = '.'.join(str(file).split('/')[-1].split('.')[:-1])
         weight = jnp.load(file=file, mmap_mode='r', allow_pickle=True)
         partition_spec = create_partition_spec(name)
         sharding = NamedSharding(mesh, partition_spec)
+        if any(lyr in name for lyr in ['wq', 'wk', 'wv', 'wo', 'w1', 'w2', 'w3']):
+            weight = weight.T
+            if 'wq' in name or 'wk' in name or 'wv' in name:
+                weight = weight.reshape(-1, model_params.n_local_heads if 'wq' in name else model_params.n_local_kv_heads, model_params.head_dim)
+        print(name, weight.shape, sharding._to_xla_hlo_sharding(weight.ndim))
         w[name] = jax.device_put(weight, sharding)
-    
-    for i in range(n_layers):
+
+    for i in range(model_params.n_layers):
         layer_weights.append(LayerWeights(
             wq=w[f'layers.{i}.attention.wq.weight'],
             wk=w[f'layers.{i}.attention.wk.weight'],
@@ -80,4 +85,4 @@ def load_weights(ckpt_dir: Path, n_layers: int = 80):
         layer_weights=layer_weights
     )
 
-    return xfmr_weights
+    return xfmr_weights, mesh
