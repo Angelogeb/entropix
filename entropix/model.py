@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+import math
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,7 @@ shard = jax.lax.with_sharding_constraint
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 USE_PL_RMS_NORM = True
+USE_CUDNN_ATTENTION = True
 
 def rms_norm(x: jax.Array, w: jax.Array, eps: float = 1e-6) -> jax.Array:
   x = shard(x, PS())
@@ -42,16 +44,43 @@ def attention(x: jax.Array, layer_weights: LayerWeights, model_params, cur_pos: 
   xv = jnp.einsum('...e,enh->...nh', x, layer_weights.wv)
   xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
   keys, values, kvcache = kvcache.update(xk, xv, layer_idx, cur_pos, n_rep)
-  scores = jnp.einsum('...qnh,...knh->...nqk', xq, keys)
-  pre_scores = scores / jnp.sqrt(model_params.head_dim)
-  scores = pre_scores.astype(jnp.float32)  # Always do attention softmax at float32
-  if attn_mask is not None:
-    scores = scores.at[..., :attn_mask.shape[-1]].add(attn_mask)
-  mask = jnp.where(scores != 0.0, scores, DEFAULT_MASK_VALUE)
-  padded_logits = jnp.where((mask >= DEFAULT_MASK_VALUE * 0.5), scores, DEFAULT_MASK_VALUE)
-  scores = jax.nn.softmax(padded_logits, axis=-1).astype(x.dtype)
-  output = jnp.einsum('...nqk,...knh->...qnh', scores, values)
-  output = output.reshape((output.shape[0], output.shape[1], -1))
+  
+  if USE_CUDNN_ATTENTION:
+    bf16 = jnp.bfloat16
+    assert xq.ndim == keys.ndim == values.ndim == 4
+    # check the sharding annotation here
+    q = shard(xq.astype(bf16), PS(None, None, "mp", None)) # [B, H, T, D]
+    k = shard(keys.astype(bf16), PS(None, None, "mp", None)) # [B, H, S, D]
+    v = shard(values.astype(bf16), PS(None, None, "mp", None)) # [B, H, S, D]
+    if attn_mask is not None:
+      mask = (attn_mask > 0.5 * jnp.finfo(bf16).min)[None, :, :]
+      mask = jnp.pad(mask, ((0, 0), (0, 0), (0, keys.shape[1] - xq.shape[1])))
+    else:
+      assert q.shape[1] == 1
+      mask = jnp.swapaxes(jnp.any(k != 0, axis=-1), -2, -1)[:, :, None, :]
+      # check the sharding annotation here
+      mask = shard(mask, PS(None, "mp", None, None)) # [B, H, T, S]
+    output = jax.nn.dot_product_attention(q, k, v, mask=mask, 
+                                          scale=float(1.0 / math.sqrt(model_params.head_dim)), 
+                                          implementation="cudnn").astype(xq.dtype)
+    # perhaps omit this computation for performance
+    # but it's being used in sampling
+    pre_scores = jnp.einsum('...qnh,...knh->...nqk', xq, keys) / jnp.sqrt(model_params.head_dim)
+
+    output = output.reshape((output.shape[0], output.shape[1], -1))
+  else:
+    scores = jnp.einsum('...qnh,...knh->...nqk', xq, keys)
+    pre_scores = scores / jnp.sqrt(model_params.head_dim)
+    scores = pre_scores.astype(jnp.float32)  # Always do attention softmax at float32
+    if attn_mask is not None:
+      scores = scores.at[..., :attn_mask.shape[-1]].add(attn_mask)
+    mask = jnp.where(scores != 0.0, scores, DEFAULT_MASK_VALUE)
+
+    padded_logits = jnp.where((mask >= DEFAULT_MASK_VALUE * 0.5), scores, DEFAULT_MASK_VALUE)
+    scores = jax.nn.softmax(padded_logits, axis=-1).astype(x.dtype)
+    output = jnp.einsum('...nqk,...knh->...qnh', scores, values)
+    output = output.reshape((output.shape[0], output.shape[1], -1))
+
   out = shard(jnp.dot(output, layer_weights.wo), PS())
   return out, kvcache, pre_scores
 
