@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Tuple
 
 import math
@@ -82,7 +83,6 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instru
     kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
     logits, kvcache, _, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
     next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
-    print(tokenizer.decode([next_token.item()]), end='', flush=True)
     cur_pos = seqlen
     stop = jax.device_put(jnp.array([128001, 128008, 128009]), replicated)
     sampler_cfg = SamplerConfig()
@@ -90,6 +90,7 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instru
     profile = False
     start_pos = cur_pos
 
+    prev_token = next_token
     start = time.time()
     while cur_pos < 8192:
       cur_pos += 1
@@ -100,11 +101,13 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instru
       logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis, kvcache, decode=True)
       next_token = sample_fn(logits, scores, cfg=sampler_cfg)
       gen_tokens.append(next_token)
-      out_token = tokenizer.decode(next_token.tolist()[0])
+      out_token = tokenizer.decode(prev_token.tolist()[0])
       print(out_token, end='', flush=True)
       if profile and cur_pos == start_pos + 10:
         jax.profiler.stop_trace()
-      if jnp.isin(next_token, stop).any():
+      should_stop = jnp.isin(prev_token, stop).any()
+      prev_token = next_token
+      if should_stop:
         break
 
     print(f"{(cur_pos - (start_pos + 10))/(time.time() - start):.3} toks/s")

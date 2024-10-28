@@ -17,7 +17,7 @@ shard = jax.lax.with_sharding_constraint
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 USE_PL_RMS_NORM = True
-USE_CUDNN_ATTENTION = True
+USE_CUDNN_ATTENTION = False
 
 def rms_norm(x: jax.Array, w: jax.Array, eps: float = 1e-6) -> jax.Array:
   x = shard(x, PS())

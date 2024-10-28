@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Dict, Tuple
 
 import math
@@ -195,10 +196,11 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
         # else:
 
         # If we've just asked a question, sample with slightly higher temperature
-        temp_adj = cfg.high_entropy_attention_offset + cfg.high_entropy_attention_coefficient * attn_ent  # Increase temperature based on attention entropy
+        helv_temp_adj = cfg.high_entropy_attention_offset + cfg.high_entropy_attention_coefficient * attn_ent  # Increase temperature based on attention entropy
+        helv_temperature = jnp.minimum(1.5, cfg.temperature * helv_temp_adj)
         return _sample(
             logits,
-            temperature=jnp.minimum(1.5, cfg.temperature * temp_adj),
+            temperature=helv_temperature,
             top_p=cfg.top_p,
             top_k=cfg.top_k,
             min_p=cfg.min_probability,
@@ -207,13 +209,14 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
 
     # Low Entropy, High Varentropy: "exploring forks in the path"
     def lehv():
-        temp_adj = cfg.low_entropy_interaction_strength_offset + cfg.low_entropy_interaction_strength_coefficient * interaction_strength  # Increase temperature based on interaction strength
-        top_k_adj = jnp.maximum(5, (cfg.top_k * (1 + 0.5 * (1 - agreement))).astype(int))  # Increase top_k when agreement is low
+        lehv_temp_adj = cfg.low_entropy_interaction_strength_offset + cfg.low_entropy_interaction_strength_coefficient * interaction_strength  # Increase temperature based on interaction strength
+        lehv_temperature = jnp.minimum(1.5, cfg.temperature * lehv_temp_adj)
+        lehv_top_k = jnp.maximum(5, (cfg.top_k * (1 + 0.5 * (1 - agreement))).astype(int))  # Increase top_k when agreement is low
         return _sample(
             logits,
-            temperature=jnp.minimum(1.5, cfg.temperature * temp_adj),
+            temperature=lehv_temperature,
             top_p=cfg.top_p,
-            top_k=top_k_adj,
+            top_k=lehv_top_k,
             min_p=cfg.min_probability,
             key=key
         )
@@ -221,12 +224,13 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
     # High Entropy, High Varentropy: "resampling in the mist"
     def hehv():
         # Use high temperature and adjusted top_p based on attention metrics
-        temp_adj = cfg.high_entropy_varentropy_attention_offset + cfg.high_entropy_varentropy_attention_coefficient * attn_vent  # Increase temperature based on attention varentropy
-        top_p_adj = jnp.maximum(0.5, cfg.top_p - cfg.high_entropy_attention_coefficient * attn_ent)  # Decrease top_p when attention entropy is high
+        hehv_temp_adj = cfg.high_entropy_varentropy_attention_offset + cfg.high_entropy_varentropy_attention_coefficient * attn_vent  # Increase temperature based on attention varentropy
+        hehv_temperature = jnp.minimum(2.0, cfg.temperature * hehv_temp_adj)
+        hehv_top_p = jnp.maximum(0.5, cfg.top_p - cfg.high_entropy_attention_coefficient * attn_ent)  # Decrease top_p when attention entropy is high
         return _sample(
             logits,
-            temperature=jnp.minimum(2.0, cfg.temperature * temp_adj),
-            top_p=top_p_adj,
+            temperature=hehv_temperature,
+            top_p=hehv_top_p,
             top_k=cfg.top_k,
             min_p=cfg.min_probability,
             key=key
@@ -265,17 +269,16 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
 
         keys = jax.random.split(key, cfg.number_of_adaptive_samples)
 
-        samples = []
-        for sample_key in keys:
-            sample = _sample(
-                logits,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                key=sample_key
-            )
-            samples.append(sample)
+        sample_fn = jax.vmap(partial(
+            _sample,
+            logits=logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p
+        ))
+
+        samples = sample_fn(key=keys)
 
         def score_sample(sample):
             log_prob = jnp.sum(
@@ -292,7 +295,7 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
             )
             return log_prob + confidence_score
 
-        sample_scores = jnp.array([score_sample(sample) for sample in samples])
+        sample_scores = score_sample(samples) # jnp.array([score_sample(sample) for sample in samples])
         best_sample_idx = jnp.argmax(sample_scores)
         return jnp.array(samples)[best_sample_idx]
 
@@ -306,7 +309,7 @@ def sample(logits: jax.Array, attention_scores: jax.Array, cfg: SamplerConfig,
     #     res = hehv()
     # else:
     #     res = adaptive_sampling()
-
+    return jnp.stack((lelv(), helv(), lehv(), hehv(), adaptive_sampling()))[case]
     return jax.lax.switch(case, (lelv, helv, lehv, hehv, adaptive_sampling))
     # assert  jax.lax.switch(case, (lelv, helv, lehv, hehv, adaptive_sampling)) == res
     # return res
